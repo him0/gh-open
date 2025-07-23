@@ -1,13 +1,17 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/mattn/go-isatty"
 )
@@ -15,6 +19,14 @@ import (
 type Remote struct {
 	Name string
 	URL  string
+}
+
+type PullRequest struct {
+	Number int    `json:"number"`
+	URL    string `json:"html_url"`
+	Head   struct {
+		Ref string `json:"ref"`
+	} `json:"head"`
 }
 
 var (
@@ -27,6 +39,7 @@ var (
 	verbose    bool
 	colorFlag  string
 	listFlag   bool
+	forceNewFlag bool
 )
 
 func main() {
@@ -34,12 +47,14 @@ func main() {
 	flag.BoolVar(&verbose, "verbose", false, "verbose output")
 	flag.StringVar(&colorFlag, "color", "auto", "colorize output (always, never, auto)")
 	flag.BoolVar(&listFlag, "list", false, "open pull requests list instead of new PR")
+	flag.BoolVar(&forceNewFlag, "force-new", false, "force open new PR page even if existing PR exists")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nOptions:\n")
 		fmt.Fprintf(os.Stderr, "  --verbose\n        verbose output\n")
 		fmt.Fprintf(os.Stderr, "  --color string\n        colorize output (always, never, auto) (default \"auto\")\n")
 		fmt.Fprintf(os.Stderr, "  --list\n        open pull requests list instead of new PR\n")
+		fmt.Fprintf(os.Stderr, "  --force-new\n        force open new PR page even if existing PR exists\n")
 	}
 	flag.Parse()
 
@@ -82,8 +97,27 @@ func main() {
 			exitWithError("Failed to get current branch: %s", err.Error())
 		}
 
-		// Generate new pull request URL
-		url = fmt.Sprintf("https://github.com/%s/pull/new/%s", repoURL, currentBranch)
+		if forceNewFlag {
+			// Force new PR page
+			url = fmt.Sprintf("https://github.com/%s/pull/new/%s", repoURL, currentBranch)
+		} else {
+			// Check if there's an existing PR for this branch
+			existingPR, err := checkExistingPR(repoURL, currentBranch)
+			if err != nil {
+				verboseLog("Warning: Failed to check existing PR", []string{err.Error()})
+				// Fall back to new PR URL
+				url = fmt.Sprintf("https://github.com/%s/pull/new/%s", repoURL, currentBranch)
+			} else if existingPR != nil {
+				// Use existing PR URL
+				url = existingPR.URL
+				if verbose {
+					verboseLog("Found existing PR", []string{fmt.Sprintf("#%d", existingPR.Number)})
+				}
+			} else {
+				// Generate new pull request URL
+				url = fmt.Sprintf("https://github.com/%s/pull/new/%s", repoURL, currentBranch)
+			}
+		}
 	}
 
 	// Display URL
@@ -227,6 +261,65 @@ func colorizeOutput() bool {
 	default:
 		return isatty.IsTerminal(os.Stdout.Fd())
 	}
+}
+
+func getGitHubToken() (string, error) {
+	cmd := exec.Command("gh", "auth", "token")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func checkExistingPR(repoURL, branch string) (*PullRequest, error) {
+	token, err := getGitHubToken()
+	if err != nil {
+		return nil, err
+	}
+
+	parts := strings.Split(repoURL, "/")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid repository URL format")
+	}
+	owner, repo := parts[0], parts[1]
+
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls?head=%s:%s&state=open", owner, repo, owner, branch)
+	
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Authorization", "token "+token)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var pullRequests []PullRequest
+	if err := json.Unmarshal(body, &pullRequests); err != nil {
+		return nil, err
+	}
+
+	if len(pullRequests) == 0 {
+		return nil, nil
+	}
+
+	return &pullRequests[0], nil
 }
 
 func exitWithError(format string, args ...interface{}) {
